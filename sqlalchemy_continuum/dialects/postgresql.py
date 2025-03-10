@@ -80,6 +80,46 @@ $$
 LANGUAGE plpgsql
 """
 
+procedure_sql_no_temp_table = """
+    CREATE OR REPLACE FUNCTION {procedure_name}() RETURNS TRIGGER AS $$
+    DECLARE transaction_id_value BIGINT;
+    BEGIN
+        BEGIN
+            transaction_id_value = (SELECT id FROM temporary_transaction LIMIT 1);
+        EXCEPTION WHEN others THEN
+            -- Create transaction if it doesn't exist
+            INSERT INTO transaction (issued_at) 
+            VALUES (now()) 
+            RETURNING id INTO transaction_id_value;
+        END;
+        
+        IF transaction_id_value IS NULL THEN
+            INSERT INTO transaction (issued_at) 
+            VALUES (now()) 
+            RETURNING id INTO transaction_id_value;
+        END IF;
+        
+        IF (TG_OP = 'INSERT') THEN
+            {after_insert}
+            {upsert_insert}
+        ELSIF (TG_OP = 'UPDATE') THEN
+            IF (hstore(NEW.*) - hstore(OLD.*) - ARRAY[{excluded_columns}]::text[])
+                = hstore('')
+            THEN
+                RETURN NULL;
+            END IF;
+            {after_update}
+            {upsert_update}
+        ELSIF (TG_OP = 'DELETE') THEN
+            {after_delete}
+            {upsert_delete}
+        END IF;
+        RETURN NEW;
+    END;
+    $$
+    LANGUAGE plpgsql
+    """
+
 validity_sql = """
 UPDATE {version_table_name}
 SET {end_transaction_column} = transaction_id_value
@@ -94,8 +134,7 @@ WHERE
 
 def uses_property_mod_tracking(manager):
     return any(
-        isinstance(plugin, PropertyModTrackerPlugin)
-        for plugin in manager.plugins
+        isinstance(plugin, PropertyModTrackerPlugin) for plugin in manager.plugins
     )
 
 
@@ -134,49 +173,43 @@ class SQLConstruct(object):
     @property
     def transaction_table_name(self):
         if self.table.schema:
-            return '%s.transaction' % self.table.schema
+            return "%s.transaction" % self.table.schema
         else:
-            return 'transaction'
+            return "transaction"
 
     @property
     def temporary_transaction_table_name(self):
-        return 'temporary_transaction'
+        return "temporary_transaction"
 
     @property
     def version_table_name(self):
         version_table_name = self.version_table_name_format % self.table.name
         if self.table.schema:
-            version_table_name = '%s.%s' % (
-                self.table.schema, version_table_name
-            )
+            version_table_name = "%s.%s" % (self.table.schema, version_table_name)
         return version_table_name
 
     @classmethod
     def for_manager(self, manager, cls):
-        strategy = manager.option(cls, 'strategy')
-        operation_type_column = manager.option(
-            cls,
-            'operation_type_column_name'
-        )
+        strategy = manager.option(cls, "strategy")
+        operation_type_column = manager.option(cls, "operation_type_column_name")
         excluded_columns = [
-            c.name for c in sa.inspect(cls).columns
+            c.name
+            for c in sa.inspect(cls).columns
             if manager.is_excluded_column(cls, c)
         ]
         return self(
             update_validity_for_tables=(
-                sa.inspect(cls).tables if strategy == 'validity' else []
+                sa.inspect(cls).tables if strategy == "validity" else []
             ),
-            version_table_name_format=manager.option(cls, 'table_name'),
+            version_table_name_format=manager.option(cls, "table_name"),
             operation_type_column_name=operation_type_column,
-            transaction_column_name=manager.option(
-                cls, 'transaction_column_name'
-            ),
+            transaction_column_name=manager.option(cls, "transaction_column_name"),
             end_transaction_column_name=manager.option(
-                cls, 'end_transaction_column_name'
+                cls, "end_transaction_column_name"
             ),
             use_property_mod_tracking=uses_property_mod_tracking(manager),
             excluded_columns=excluded_columns,
-            table=cls.__table__
+            table=cls.__table__,
         )
 
     @property
@@ -192,56 +225,51 @@ class SQLConstruct(object):
         return [c for c in self.columns if c.primary_key]
 
     def copy_args(self):
-        return dict(
-            (k, v) for k, v in self.__dict__.items() if not k.startswith('__')
-        )
+        return dict((k, v) for k, v in self.__dict__.items() if not k.startswith("__"))
 
 
 class UpsertSQL(SQLConstruct):
     builders = {
-        'update_values': ', ',
-        'insert_values': ', ',
-        'column_names': ', ',
-        'primary_key_criteria': ' AND ',
+        "update_values": ", ",
+        "insert_values": ", ",
+        "column_names": ", ",
+        "primary_key_criteria": " AND ",
     }
 
     def __init__(self, *args, **kwargs):
         SQLConstruct.__init__(self, *args, **kwargs)
 
         for key in self.builders:
-            setattr(self, key, getattr(self, 'build_%s' % key)())
+            setattr(self, key, getattr(self, "build_%s" % key)())
 
     def build_column_names(self):
         column_names = ['"%s"' % c.name for c in self.columns]
         if self.use_property_mod_tracking:
-            column_names += [
-                '%s_mod' % c.name for c in self.columns_without_pks
-            ]
+            column_names += ["%s_mod" % c.name for c in self.columns_without_pks]
         return column_names
 
     def build_primary_key_criteria(self):
         return [
             '"{name}" = NEW."{name}"'.format(name=c.name)
-            for c in self.columns if c.primary_key
+            for c in self.columns
+            if c.primary_key
         ]
 
     def build_update_values(self):
         parent_columns = [
-            '"{name}" = NEW."{name}"'.format(name=c.name)
-            for c in self.columns
+            '"{name}" = NEW."{name}"'.format(name=c.name) for c in self.columns
         ]
         mod_columns = []
         if self.use_property_mod_tracking:
             mod_columns = [
-                '{0}_mod = {0}_mod OR OLD."{0}" IS DISTINCT FROM NEW."{0}"'
-                .format(c.name)
+                '{0}_mod = {0}_mod OR OLD."{0}" IS DISTINCT FROM NEW."{0}"'.format(
+                    c.name
+                )
                 for c in self.columns_without_pks
             ]
 
         return (
-            ['%s = 1' % self.operation_type_column_name] +
-            parent_columns +
-            mod_columns
+            ["%s = 1" % self.operation_type_column_name] + parent_columns + mod_columns
         )
 
     def build_insert_values(self):
@@ -275,19 +303,13 @@ class DeleteUpsertSQL(UpsertSQL):
     operation_type = 2
 
     def build_primary_key_criteria(self):
-        return [
-            '"{name}" = OLD."{name}"'.format(name=c.name)
-            for c in self.pk_columns
-        ]
+        return ['"{name}" = OLD."{name}"'.format(name=c.name) for c in self.pk_columns]
 
     def build_mod_tracking_values(self):
-        return ['True'] * len(self.columns_without_pks)
+        return ["True"] * len(self.columns_without_pks)
 
     def build_update_values(self):
-        return [
-            '"{name}" = OLD."{name}"'.format(name=c.name)
-            for c in self.columns
-        ]
+        return ['"{name}" = OLD."{name}"'.format(name=c.name) for c in self.columns]
 
     def build_values(self):
         return ['OLD."%s"' % c.name for c in self.columns]
@@ -297,7 +319,7 @@ class InsertUpsertSQL(UpsertSQL):
     operation_type = 0
 
     def build_mod_tracking_values(self):
-        return ['True'] * len(self.columns_without_pks)
+        return ["True"] * len(self.columns_without_pks)
 
 
 class UpdateUpsertSQL(UpsertSQL):
@@ -305,17 +327,16 @@ class UpdateUpsertSQL(UpsertSQL):
 
     def build_mod_tracking_values(self):
         return [
-            'OLD."{0}" IS DISTINCT FROM NEW."{0}"'
-            .format(c.name) for c in self.columns_without_pks
+            'OLD."{0}" IS DISTINCT FROM NEW."{0}"'.format(c.name)
+            for c in self.columns_without_pks
         ]
 
 
 class ValiditySQL(SQLConstruct):
     @property
     def primary_key_criteria(self):
-        return ' AND '.join(
-            '"{name}" = NEW."{name}"'.format(name=c.name)
-            for c in self.pk_columns
+        return " AND ".join(
+            '"{name}" = NEW."{name}"'.format(name=c.name) for c in self.pk_columns
         )
 
     def __str__(self):
@@ -324,7 +345,7 @@ class ValiditySQL(SQLConstruct):
             transaction_table_name=self.transaction_table_name,
             transaction_column=self.transaction_column_name,
             end_transaction_column=self.end_transaction_column_name,
-            primary_key_criteria=self.primary_key_criteria
+            primary_key_criteria=self.primary_key_criteria,
         )
         return validity_sql.format(**params)
 
@@ -340,24 +361,23 @@ class UpdateValiditySQL(ValiditySQL):
 class DeleteValiditySQL(ValiditySQL):
     @property
     def primary_key_criteria(self):
-        return ' AND '.join(
-            '{name} = OLD."{name}"'.format(name=c.name)
-            for c in self.pk_columns
+        return " AND ".join(
+            '{name} = OLD."{name}"'.format(name=c.name) for c in self.pk_columns
         )
 
 
 def get_validity_sql(class_, tables, params):
     params = params.copy()
-    del params['table']
-    return ''.join(str(class_(table, **params)) for table in tables)
+    del params["table"]
+    return "".join(str(class_(table, **params)) for table in tables)
 
 
 class CreateTriggerSQL(SQLConstruct):
     def __str__(self):
         return trigger_sql.format(
-            trigger_name='%s_trigger' % self.table.name,
+            trigger_name="%s_trigger" % self.table.name,
             table_name=self.table_name,
-            procedure_name='%s_audit' % self.table.name
+            procedure_name="%s_audit" % self.table.name,
         )
 
 
@@ -367,24 +387,24 @@ class TransactionSQLConstruct(object):
 
 
 class CreateTemporaryTransactionTableSQL(TransactionSQLConstruct):
-    table_name = 'temporary_transaction'
+    table_name = "temporary_transaction"
 
     def __str__(self):
         return temporary_transaction_sql.format(
             temporary_transaction_table=self.table_name,
-            transaction_table_columns='id BIGINT, PRIMARY KEY(id)'
+            transaction_table_columns="id BIGINT, PRIMARY KEY(id)",
         )
 
 
 class InsertTemporaryTransactionSQL(TransactionSQLConstruct):
-    table_name = 'temporary_transaction'
-    transaction_values = 'transaction_id_value'
+    table_name = "temporary_transaction"
+    transaction_values = "transaction_id_value"
 
     def __str__(self):
         return insert_temporary_transaction_sql.format(
             temporary_transaction_table=self.table_name,
-            transaction_table_columns='id',
-            transaction_values=self.transaction_values
+            transaction_table_columns="id",
+            transaction_values=self.transaction_values,
         )
 
 
@@ -396,24 +416,28 @@ class CreateTriggerFunctionSQL(SQLConstruct):
         after_update = get_validity_sql(UpdateValiditySQL, tables, args)
         after_delete = get_validity_sql(DeleteValiditySQL, tables, args)
 
-        sql = procedure_sql.format(
-            procedure_name='%s_audit' % self.table.name,
-            excluded_columns=', '.join(
-                "'%s'" % c for c in self.excluded_columns
-            ),
-            transaction_table_name=self.transaction_table_name,
+        # sql = procedure_sql.format(
+        #     procedure_name="%s_audit" % self.table.name,
+        #     excluded_columns=", ".join("'%s'" % c for c in self.excluded_columns),
+        #     transaction_table_name=self.transaction_table_name,
+        #     after_insert=after_insert,
+        #     after_update=after_update,
+        #     after_delete=after_delete,
+        #     temporary_transaction_sql=(CreateTemporaryTransactionTableSQL()),
+        #     insert_temporary_transaction_sql=(InsertTemporaryTransactionSQL()),
+        #     upsert_insert=InsertUpsertSQL(**args),
+        #     upsert_update=UpdateUpsertSQL(**args),
+        #     upsert_delete=DeleteUpsertSQL(**args),
+        # )
+        sql = procedure_sql_no_temp_table.format(
+            procedure_name="%s_audit" % self.table.name,
+            excluded_columns=", ".join("'%s'" % c for c in self.excluded_columns),
             after_insert=after_insert,
             after_update=after_update,
             after_delete=after_delete,
-            temporary_transaction_sql=(
-                CreateTemporaryTransactionTableSQL()
-            ),
-            insert_temporary_transaction_sql=(
-                InsertTemporaryTransactionSQL()
-            ),
             upsert_insert=InsertUpsertSQL(**args),
             upsert_update=UpdateUpsertSQL(**args),
-            upsert_delete=DeleteUpsertSQL(**args)
+            upsert_delete=DeleteUpsertSQL(**args),
         )
         return sql
 
@@ -425,9 +449,9 @@ class TransactionTriggerSQL(object):
     @property
     def transaction_table_name(self):
         if self.table.schema:
-            return '%s.transaction' % self.table.schema
+            return "%s.transaction" % self.table.schema
         else:
-            return 'transaction'
+            return "transaction"
 
     def __str__(self):
         return temp_transaction_trigger_sql.format(
@@ -438,21 +462,20 @@ class TransactionTriggerSQL(object):
 def create_versioning_trigger_listeners(manager, cls):
     sa.event.listen(
         cls.__table__,
-        'after_create',
-        sa.schema.DDL(str(CreateTriggerFunctionSQL.for_manager(manager, cls)))
+        "after_create",
+        sa.schema.DDL(str(CreateTriggerFunctionSQL.for_manager(manager, cls))),
     )
     sa.event.listen(
         cls.__table__,
-        'after_create',
-        sa.schema.DDL(str(CreateTriggerSQL.for_manager(manager, cls)))
+        "after_create",
+        sa.schema.DDL(str(CreateTriggerSQL.for_manager(manager, cls))),
     )
     sa.event.listen(
         cls.__table__,
-        'after_drop',
+        "after_drop",
         sa.schema.DDL(
-            'DROP FUNCTION IF EXISTS %s()' %
-            '%s_audit' % cls.__table__.name,
-        )
+            "DROP FUNCTION IF EXISTS %s()" % "%s_audit" % cls.__table__.name,
+        ),
     )
 
 
@@ -474,30 +497,25 @@ def sync_trigger(session, table_name, **kwargs):
     .. versionadded: 1.1.0
     """
     meta = sa.MetaData()
-    version_table = sa.Table(
-        table_name,
-        meta,
-        autoload_with=session.connection()
-    )
+    version_table = sa.Table(table_name, meta, autoload_with=session.connection())
     parent_table = sa.Table(
-        table_name[0:-len('_version')],
-        meta,
-        autoload_with=session.connection()
+        table_name[0 : -len("_version")], meta, autoload_with=session.connection()
     )
-    excluded_columns = (
-        set(c.name for c in parent_table.c) -
-        set(c.name for c in version_table.c if not c.name.endswith('_mod'))
+    excluded_columns = set(c.name for c in parent_table.c) - set(
+        c.name for c in version_table.c if not c.name.endswith("_mod")
     )
     drop_trigger(session, parent_table.name)
-    create_trigger(session, table=parent_table, excluded_columns=excluded_columns, **kwargs)
+    create_trigger(
+        session, table=parent_table, excluded_columns=excluded_columns, **kwargs
+    )
 
 
 def create_trigger(
     session,
     table,
-    transaction_column_name='transaction_id',
-    operation_type_column_name='operation_type',
-    version_table_name_format='%s_version',
+    transaction_column_name="transaction_id",
+    operation_type_column_name="operation_type",
+    version_table_name_format="%s_version",
     excluded_columns=None,
     use_property_mod_tracking=True,
     end_transaction_column_name=None,
@@ -517,10 +535,7 @@ def create_trigger(
 
 
 def drop_trigger(session, table_name):
-    session.execute(sa.text(
-        'DROP TRIGGER IF EXISTS %s_trigger ON "%s"' % (
-            table_name,
-            table_name
-        )
-    ))
-    session.execute(sa.text('DROP FUNCTION IF EXISTS %s_audit()' % table_name))
+    session.execute(
+        sa.text('DROP TRIGGER IF EXISTS %s_trigger ON "%s"' % (table_name, table_name))
+    )
+    session.execute(sa.text("DROP FUNCTION IF EXISTS %s_audit()" % table_name))
