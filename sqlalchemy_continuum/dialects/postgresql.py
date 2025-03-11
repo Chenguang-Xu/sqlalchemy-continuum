@@ -291,6 +291,7 @@ class UpsertSQL(SQLConstruct):
             operation_type=self.operation_type,
             operation_type_column=self.operation_type_column_name,
             transaction_table_name=self.transaction_table_name,
+            end_transaction_column=self.end_transaction_column_name,
         )
         for key, join_operator in self.builders.items():
             params[key] = join_operator.join(getattr(self, key))
