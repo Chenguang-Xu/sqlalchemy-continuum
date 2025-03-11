@@ -19,6 +19,18 @@ WITH upsert as
         AND
         {primary_key_criteria}
     RETURNING *
+),
+update_validity as
+(
+    UPDATE {version_table_name}
+    SET {end_transaction_column} = transaction_id_value
+    WHERE
+        {end_transaction_column} IS NULL
+        AND
+        {primary_key_criteria}
+        AND
+        {transaction_column} != transaction_id_value
+    RETURNING *
 )
 INSERT INTO {version_table_name}
 ({transaction_column}, {operation_type_column}, {column_names})
